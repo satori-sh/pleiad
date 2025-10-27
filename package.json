@@ -1,5 +1,5 @@
 {
-  "name": "rift",
+  "name": "pleiad",
   "module": "index.ts",
   "type": "module",
   "private": true,
