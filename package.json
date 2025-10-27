@@ -1,12 +1,15 @@
 {
   "name": "pleiad",
   "module": "index.ts",
-  "type": "module",
-  "private": true,
   "devDependencies": {
     "@types/bun": "latest"
   },
   "peerDependencies": {
     "typescript": "^5"
+  },
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "wrangler": "^4.45.0"
   }
 }
