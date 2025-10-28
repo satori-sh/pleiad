@@ -3,14 +3,14 @@ export type OAuthSpec = {
   tokenUrl: string;
   clientId: string;
   clientSecret?: string;
-  usePKCE?: boolean;
   scopes: string[];
 };
 
 export type ProviderConfig = {
   id: string;
-  oauth: OAuthSpec;
-  tools: ToolSpec[];
+  mcpUrl: string;
+  oauth?: OAuthSpec;
+  apiToken?: string; // For providers that use direct API tokens (like Sentry MCP)
 };
 
 export type ToolSpec = {
@@ -56,4 +56,11 @@ export type TokenStore = {
   setToken(tenantId: string, providerId: string, accountId: string, token: Token): Promise<void>;
   revokeToken(tenantId: string, providerId: string, accountId: string): Promise<void>;
   getAccounts(tenantId: string, providerId: string): Promise<string[]>;
+};
+
+export type PleiadConfig = {
+  name: string;
+  providers: ProviderConfig[];
+  store: TokenStore;
+  baseUrl: string;
 };
