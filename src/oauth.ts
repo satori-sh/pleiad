@@ -12,11 +12,61 @@ export class OAuthError extends Error {
   }
 }
 
-// TODO:  Add JSDoc and describe what is consuming this, what it does
+/**
+ * Generate cryptographically secure random state string for OAuth
+ *
+ * Used to prevent CSRF attacks by creating unique state per OAuth flow.
+ * Called by getAuthorizationUrl to create state parameter.
+ *
+ * @returns 64-character hexadecimal string
+ */
 function generateRandomState(): string {
   const array = new Uint8Array(32);
   crypto.getRandomValues(array);
   return Array.from(array, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+/**
+ * Generate PKCE code verifier
+ *
+ * Creates a cryptographically random string for PKCE flow.
+ * Must be 43-128 characters from [A-Z][a-z][0-9]-._~
+ *
+ * @returns Base64url encoded random string (43 characters)
+ */
+function generateCodeVerifier(): string {
+  const array = new Uint8Array(32);
+  crypto.getRandomValues(array);
+  return base64UrlEncode(array);
+}
+
+/**
+ * Generate PKCE code challenge from verifier
+ *
+ * Creates SHA256 hash of the verifier and base64url encodes it.
+ *
+ * @param verifier - The code verifier to hash
+ * @returns Base64url encoded SHA256 hash
+ */
+async function generateCodeChallenge(verifier: string): Promise<string> {
+  const encoder = new TextEncoder();
+  const data = encoder.encode(verifier);
+  const hash = await crypto.subtle.digest('SHA-256', data);
+  return base64UrlEncode(new Uint8Array(hash));
+}
+
+/**
+ * Base64url encode a Uint8Array
+ *
+ * @param array - The array to encode
+ * @returns Base64url encoded string
+ */
+function base64UrlEncode(array: Uint8Array): string {
+  const base64 = btoa(String.fromCharCode(...array));
+  return base64
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=/g, '');
 }
 
 /**
@@ -28,8 +78,18 @@ function generateRandomState(): string {
  * 3. Store tokens in TokenStore (Durable Objects)
  * 4. Auto-refresh expired tokens
  * 5. Revoke tokens when requested
+ * 
+ * @class OAuthManager
  */
 export class OAuthManager {
+  private codeVerifiers: Map<string, string> = new Map(); // Maps state -> code_verifier
+  private registeredClients: Map<string, string> = new Map(); // Maps provider ID -> dynamically registered client_id
+
+  /**
+   * @param tokenStore - Storage backend for persisting OAuth tokens
+   * @param providers - Map of provider IDs to OAuth configuration
+   * @param baseUrl - Base URL for OAuth redirect URIs
+   */
   constructor(
     private tokenStore: TokenStore,
     private providers: Map<string, OAuthSpec>,
@@ -39,7 +99,7 @@ export class OAuthManager {
   /**
    * Handle OAuth callback from provider
    * Extracts provider ID and user ID from state parameter
-   * 
+   *
    * State format: "providerId:userId:randomness"
    */
   async handleCallback(
@@ -48,7 +108,7 @@ export class OAuthManager {
   ): Promise<{ token: Token; userId: string; providerId: string }> {
     // Extract provider ID and user ID from state
     const [providerId, userId] = state.split(":");
-    
+
     if (!providerId || !userId) {
       throw new OAuthError("Invalid state parameter", "INVALID_STATE");
     }
@@ -58,16 +118,40 @@ export class OAuthManager {
       throw new OAuthError(`Provider ${providerId} not configured`, "UNKNOWN_PROVIDER");
     }
 
+    // Use dynamically registered client ID if available
+    const clientId = this.registeredClients.get(providerId) || oauthSpec.clientId;
+    if (!clientId) {
+      throw new OAuthError("No client ID available for token exchange", "NO_CLIENT_ID");
+    }
+
+    const tokenParams: Record<string, string> = {
+      grant_type: "authorization_code",
+      code,
+      client_id: clientId,
+      redirect_uri: `${this.baseUrl}/oauth/callback`,
+    };
+
+    // Add client secret if not using PKCE
+    if (oauthSpec.clientSecret && !oauthSpec.usePKCE) {
+      tokenParams.client_secret = oauthSpec.clientSecret;
+    }
+
+    // Add PKCE code verifier if this flow used PKCE
+    if (oauthSpec.usePKCE) {
+      const codeVerifier = this.codeVerifiers.get(state);
+      if (!codeVerifier) {
+        throw new OAuthError("PKCE code verifier not found for this state", "MISSING_CODE_VERIFIER");
+      }
+      tokenParams.code_verifier = codeVerifier;
+
+      // Clean up stored verifier
+      this.codeVerifiers.delete(state);
+    }
+
     const response = await fetch(oauthSpec.tokenUrl, {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({
-        grant_type: "authorization_code",
-        code,
-        client_id: oauthSpec.clientId,
-        client_secret: oauthSpec.clientSecret || "",
-        redirect_uri: `${this.baseUrl}/oauth/callback`,
-      }),
+      body: new URLSearchParams(tokenParams),
     });
 
     if (!response.ok) {
@@ -100,22 +184,95 @@ export class OAuthManager {
   }
 
   /**
-   * Generate authorization URL for OAuth flow
+   * Dynamically register an OAuth client with the provider
+   * Uses RFC 7591 Dynamic Client Registration
+   *
+   * @param providerId - Provider identifier
+   * @param oauthSpec - Provider's OAuth specification
+   * @returns Registered client ID
    */
-  getAuthorizationUrl(providerId: string, userId: string): string {
+  private async registerClient(providerId: string, oauthSpec: OAuthSpec): Promise<string> {
+    if (!oauthSpec.registrationUrl) {
+      throw new OAuthError("Provider does not support dynamic client registration", "NO_REGISTRATION_ENDPOINT");
+    }
+
+    const response = await fetch(oauthSpec.registrationUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        client_name: "Pleiades",
+        redirect_uris: [`${this.baseUrl}/oauth/callback`],
+        grant_types: ["authorization_code", "refresh_token"],
+        token_endpoint_auth_method: "none"
+      })
+    });
+
+    if (!response.ok) {
+      throw new OAuthError("Client registration failed", "REGISTRATION_FAILED", response.status);
+    }
+
+    const data = await response.json() as { client_id: string };
+    const clientId = data.client_id;
+
+    // Cache the registered client ID
+    this.registeredClients.set(providerId, clientId);
+
+    return clientId;
+  }
+
+  /**
+   * Generate authorization URL for OAuth flow
+   * Supports PKCE if configured for the provider
+   * Handles dynamic client registration if needed
+   */
+  async getAuthorizationUrl(providerId: string, userId: string): Promise<string> {
     const oauthSpec = this.providers.get(providerId);
     if (!oauthSpec) {
       throw new OAuthError(`Provider ${providerId} not configured`, "UNKNOWN_PROVIDER");
     }
 
-    const state = generateRandomState();
+    // Handle dynamic client registration if needed
+    let clientId = oauthSpec.clientId;
+    if (!clientId && oauthSpec.registrationUrl) {
+      // Check if we've already registered
+      const registered = this.registeredClients.get(providerId);
+      if (registered) {
+        clientId = registered;
+      } else {
+        clientId = await this.registerClient(providerId, oauthSpec);
+      }
+    }
+
+    if (!clientId) {
+      throw new OAuthError("No client ID available and no registration endpoint configured", "NO_CLIENT_ID");
+    }
+
+    const randomState = generateRandomState();
+    const state = `${providerId}:${userId}:${randomState}`;
+
     const params = new URLSearchParams({
       response_type: "code",
-      client_id: oauthSpec.clientId,
+      client_id: clientId,
       redirect_uri: `${this.baseUrl}/oauth/callback`,
-      scope: oauthSpec.scopes.join(" "),
-      state: `${providerId}:${userId}`
+      state
     });
+
+    // Add scope if provided (some PKCE flows omit it)
+    if (oauthSpec.scopes && oauthSpec.scopes.length > 0) {
+      params.set("scope", oauthSpec.scopes.join(" "));
+    }
+
+    // Add PKCE parameters if enabled
+    if (oauthSpec.usePKCE) {
+      const codeVerifier = generateCodeVerifier();
+      const codeChallenge = await generateCodeChallenge(codeVerifier);
+
+      // Store verifier for token exchange
+      this.codeVerifiers.set(state, codeVerifier);
+
+      params.set("code_challenge", codeChallenge);
+      params.set("code_challenge_method", "S256");
+    }
 
     return `${oauthSpec.authUrl}?${params.toString()}`;
   }

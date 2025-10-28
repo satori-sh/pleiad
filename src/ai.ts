@@ -33,44 +33,34 @@ export class AIAgent {
 
   /**
    * Execute agent request with AI-powered provider and tool selection
-   * @param args - Request arguments with user prompt
+   * @param args - Request arguments with user prompt and provider ID
    * @param userId - User identifier for authentication
    * @param requestId - JSON-RPC request identifier
    * @returns JSON-RPC response with result or error
    */
   async execute(
-    args: { prompt: string },
+    args: { prompt: string; providerId: string },
     userId: string,
     requestId: number | string
   ) {
     try {
-      // Get all providers
-      const providers = await this.getProviderAuthStatus(userId);
-
-      // AI chooses from all providers, authenticated or not)
-      const selectedProviderId = await this.selectProvider(args.prompt, providers);
-      if (!selectedProviderId) {
-        return {
-          jsonrpc: '2.0',
-          id: requestId,
-          error: { code: -32603 /* JSON-RPC internal error */, message: 'Could not determine provider' }
-        };
-      }
-
-      const provider = this.providers.get(selectedProviderId);
+      const providerId = args.providerId;
+      const provider = this.providers.get(providerId);
       if (!provider) {
         return {
           jsonrpc: '2.0',
           id: requestId,
-          error: { code: -32603 /* JSON-RPC internal error */, message: `Provider ${selectedProviderId} not found` }
+          error: { code: -32603 /* JSON-RPC internal error */, message: `Provider ${providerId} not found` }
         };
       }
 
-      // Check if selected provider needs authentication
-      const selectedProviderAuth = providers.find(p => p.id === selectedProviderId);
-      if (selectedProviderAuth && provider.oauth && !selectedProviderAuth.authenticated) {
-        // Provider requires auth but isn't authenticated
-        return this.getNoAuthError(userId, requestId);
+      // Check if provider needs authentication
+      if (provider.oauth) {
+        const token = await this.oauthManager.getToken(userId, providerId);
+        if (!token) {
+          // Provider requires auth but isn't authenticated
+          return this.getNoAuthError(userId, requestId, providerId);
+        }
       }
 
       const providerTools = await this.mcpClient.getProviderTools(provider, userId);
@@ -84,7 +74,7 @@ export class AIAgent {
       }
 
       const result = await this.mcpClient.executeProviderTool(
-        selectedProviderId,
+        providerId,
         toolSelection.name,
         toolSelection.arguments,
         userId,
@@ -132,18 +122,29 @@ export class AIAgent {
    * Generate authentication error and open browser for OAuth flow
    * @param userId - User identifier for generating auth URLs
    * @param requestId - JSON-RPC request identifier
+   * @param providerId - Provider that needs authentication
    * @returns Error response with authentication URLs
    */
-  private async getNoAuthError(userId: string, requestId: number | string) {
+  private async getNoAuthError(userId: string, requestId: number | string, providerId?: string) {
     const authUrls: Record<string, string> = {};
-    for (const [id, provider] of this.providers.entries()) {
-      if (provider.oauth) {
-        authUrls[id] = this.oauthManager.getAuthorizationUrl(id, userId);
+
+    // If specific provider requested, only authorize that one
+    if (providerId) {
+      const provider = this.providers.get(providerId);
+      if (provider?.oauth) {
+        authUrls[providerId] = await this.oauthManager.getAuthorizationUrl(providerId, userId);
+      }
+    } else {
+      // Otherwise, show all providers that need auth
+      for (const [id, provider] of this.providers.entries()) {
+        if (provider.oauth) {
+          authUrls[id] = await this.oauthManager.getAuthorizationUrl(id, userId);
+        }
       }
     }
 
-    // Automatically open each auth URL in the browser
-    for (const [providerId, authUrl] of Object.entries(authUrls)) {
+    // Automatically open auth URL(s) in the browser
+    for (const authUrl of Object.values(authUrls)) {
       open(authUrl).catch(() => {
         // ignore errors for now
       });

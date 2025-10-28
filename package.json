@@ -1,5 +1,5 @@
 {
-  "name": "pleiad",
+  "name": "pleiades",
   "module": "index.ts",
   "devDependencies": {
     "@types/bun": "latest"
@@ -10,7 +10,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "bun run src/test-server.ts"
+    "dev": "bun run local.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",

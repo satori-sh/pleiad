@@ -1,0 +1,6 @@
+{
+  "client_name": "Pleiades",
+  "redirect_uris": ["https://obliging-bluegill-overly.ngrok-free.app/oauth/callback"],
+  "grant_types": ["authorization_code", "refresh_token"],
+  "token_endpoint_auth_method": "none"
+}

@@ -4,6 +4,8 @@ export type OAuthSpec = {
   clientId: string;
   clientSecret?: string;
   scopes: string[];
+  usePKCE?: boolean;
+  registrationUrl?: string; // For dynamic client registration (RFC 7591)
 };
 
 export type ProviderConfig = {
@@ -58,7 +60,7 @@ export type TokenStore = {
   getAccounts(tenantId: string, providerId: string): Promise<string[]>;
 };
 
-export type PleiadConfig = {
+export type PleiadesConfig = {
   name: string;
   providers: ProviderConfig[];
   store: TokenStore;
