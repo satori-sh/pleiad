@@ -9,7 +9,15 @@
   },
   "private": true,
   "type": "module",
+  "scripts": {
+    "dev": "bun run src/test-server.ts"
+  },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "ai": "^3.0.0",
+    "hono": "^4.0.0",
+    "open": "^10.2.0",
+    "openai": "^6.7.0",
     "wrangler": "^4.45.0"
   }
 }
