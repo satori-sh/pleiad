@@ -47,23 +47,25 @@ export function handleInitialize(config: PleiadesConfig, requestId: number | str
  * @param requestId - JSON-RPC request ID
  * @returns List of provider-specific tools
  */
-export function handleToolsList(providers: Map<string, any>, requestId: number | string) {
-  const tools = Array.from(providers.keys()).map(providerId => ({
-    name: `use_${providerId}`,
-    description: `Execute actions on ${providerId}. Provide a natural language description of what you want to do.`,
-    inputSchema: {
-      type: 'object',
-      properties: {
-        prompt: { type: 'string', description: 'Natural language request describing what you want to do' }
-      },
-      required: ['prompt']
-    }
-  }));
-
+export function handleToolsList(requestId: number | string) {
   return {
     jsonrpc: '2.0',
     id: requestId,
-    result: { tools }
+    result: {
+      tools: [
+        {
+          name: 'use_pleiades',
+          description: 'Intelligently route a natural language request to one or more providers and tools.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              prompt: { type: 'string', description: 'Natural language request describing what you want to do' }
+            },
+            required: ['prompt']
+          }
+        }
+      ]
+    }
   };
 }
 
@@ -84,11 +86,9 @@ export function handleToolsCall(
   userId: string,
   requestId: number | string,
   providers: Map<string, any>,
-  agentHandler: (args: { prompt: string; providerId: string }, userId: string, requestId: number | string) => Promise<any>
+  agentHandler: (args: { prompt: string }, userId: string, requestId: number | string) => Promise<any>
 ) {
-  // Extract provider ID from tool name (e.g., 'use_linear' -> 'linear')
-  const match = toolName.match(/^use_(.+)$/);
-  if (!match || !match[1]) {
+  if (toolName !== 'use_pleiades') {
     return {
       jsonrpc: '2.0',
       id: requestId,
@@ -96,16 +96,7 @@ export function handleToolsCall(
     };
   }
 
-  const providerId = match[1];
-  if (!providers.has(providerId)) {
-    return {
-      jsonrpc: '2.0',
-      id: requestId,
-      error: { code: -32602, message: `Unknown provider: ${providerId}` }
-    };
-  }
-
-  return agentHandler({ ...args, providerId }, userId, requestId);
+  return agentHandler({ ...args }, userId, requestId);
 }
 
 /**

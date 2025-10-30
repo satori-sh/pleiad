@@ -4,7 +4,8 @@ import { OAuthManager } from './oauth.js';
 import type { PleiadesConfig, ProviderConfig } from './types.js';
 import { AIAgent } from './ai.js';
 import { MCPClient } from './client.js';
-import { handleOAuthCallback, createMCPRouteHandler } from './routes.js';
+import { handleOAuthCallback, createMCPRouteHandler, handleOAuthRefresh } from './routes.js';
+import { InngestPublisher, NoopPublisher } from './scheduler.js';
 
 /**
  * Pleiades - Multi-provider MCP aggregator with AI-powered routing
@@ -21,6 +22,7 @@ export default class Pleiades {
   private providers: Map<string, ProviderConfig>;
   private aiAgent: AIAgent;
   private mcpClient: MCPClient;
+  private publisher: InngestPublisher | NoopPublisher;
 
   /**
    * @param config - Pleiades server configuration including providers, store, and base URL
@@ -29,17 +31,19 @@ export default class Pleiades {
     this.app = new Hono();
     this.providers = new Map(config.providers.map(p => [p.id, p]));
     
-    // Extract OAuth specs for OAuthManager
-    const oauthSpecs = new Map(
-      Array.from(this.providers.entries())
-        .filter(([_, p]) => p.oauth)
-        .map(([id, p]) => [id, p.oauth!])
-    );
-    
+    // Publisher
+    const inngestBase = process.env.INNGEST_BASE_URL || '';
+    const inngestKey = process.env.INNGEST_SIGNING_KEY || '';
+    const publisher = (inngestBase && inngestKey)
+      ? new InngestPublisher(inngestBase, inngestKey)
+      : new NoopPublisher();
+    this.publisher = publisher;
+
     this.oauthManager = new OAuthManager(
       config.store,
-      oauthSpecs,
-      config.baseUrl
+      this.providers,
+      config.baseUrl,
+      publisher
     );
 
     this.mcpClient = new MCPClient(this.oauthManager);
@@ -59,11 +63,18 @@ export default class Pleiades {
    */
   private setupRoutes() {
     this.app.get('/oauth/callback', handleOAuthCallback(this.oauthManager));
+    this.app.post('/oauth/refresh/:providerId', handleOAuthRefresh(
+      this.oauthManager,
+      this.providers,
+      // reuse same publisher for rescheduling
+      this.publisher,
+      process.env.INBOUND_SIGNING_KEY || ''
+    ));
     
     this.app.post('/mcp', createMCPRouteHandler(
       { name: this.config.name, providers: this.providers },
       (c) => this.getUserId(c),
-      async (args: { prompt: string; providerId: string }, userId: string, requestId: number | string) => {
+      async (args: { prompt: string }, userId: string, requestId: number | string) => {
         return await this.aiAgent.execute(args, userId, requestId);
       }
     ));

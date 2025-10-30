@@ -13,6 +13,7 @@ export type ProviderConfig = {
   mcpUrl: string;
   oauth?: OAuthSpec;
   apiToken?: string; // For providers that use direct API tokens (like Sentry MCP)
+  refresh?: { leadMs?: number };
 };
 
 export type ToolSpec = {

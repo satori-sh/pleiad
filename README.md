@@ -84,3 +84,16 @@ bun run dev
 
 ## Deploy
 Currently supports Cloudflare Workers. OAuth requires a database for token storage.
+
+### Token auto-refresh (Inngest)
+
+Why: We use Inngest to run durable, delayed jobs that refresh OAuth tokens before expiry. It handles retries and timing reliably. See Inngest docs: [https://www.inngest.com/docs](https://www.inngest.com/docs)
+
+How:
+- On token issue/refresh, we publish an `auth/schedule` event with `runAt = expiresAt - leadMs` (default 10m).
+- An Inngest function sleeps until `runAt` and calls `POST /oauth/refresh/:providerId`.
+- Success returns `nextRunAt`, and the function re-schedules.
+
+Config (env):
+- Workers: `INNGEST_BASE_URL`, `INNGEST_SIGNING_KEY`, `INBOUND_SIGNING_KEY`, `BASE_URL`.
+- Per provider lead time: add `refresh: { leadMs?: number }` to provider in `PleiadesConfig`.

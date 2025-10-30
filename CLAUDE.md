@@ -182,3 +182,5 @@ type MCPExport = {
 
 > turn every mcp provider into a self-contained AGENT, broker oauth once at the meta-layer, and expose only a single “use_${provider}” tool upstream—no context smog, natural-language in, curated answers out, with clear (and controllable) cost semantics.
 
+## Typescript
+Don't use the any type. You need to either create new types, use types that you would import, or use native TypeScript types but don't use any.

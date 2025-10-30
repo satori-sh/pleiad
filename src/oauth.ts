@@ -1,4 +1,5 @@
-import type { OAuthSpec, Token, TokenStore } from "./types.js";
+import type { OAuthSpec, ProviderConfig, Token, TokenStore } from "./types.js";
+import type { AuthEventPublisher } from "./scheduler.js";
 
 
 export class OAuthError extends Error {
@@ -87,13 +88,15 @@ export class OAuthManager {
 
   /**
    * @param tokenStore - Storage backend for persisting OAuth tokens
-   * @param providers - Map of provider IDs to OAuth configuration
+   * @param providers - Map of provider IDs to ProviderConfig
    * @param baseUrl - Base URL for OAuth redirect URIs
+   * @param publisher - Event publisher for scheduling refreshes
    */
   constructor(
     private tokenStore: TokenStore,
-    private providers: Map<string, OAuthSpec>,
-    private baseUrl: string
+    private providers: Map<string, ProviderConfig>,
+    private baseUrl: string,
+    private publisher: AuthEventPublisher
   ) {}
 
   /**
@@ -113,7 +116,8 @@ export class OAuthManager {
       throw new OAuthError("Invalid state parameter", "INVALID_STATE");
     }
 
-    const oauthSpec = this.providers.get(providerId);
+    const provider = this.providers.get(providerId);
+    const oauthSpec = provider?.oauth;
     if (!oauthSpec) {
       throw new OAuthError(`Provider ${providerId} not configured`, "UNKNOWN_PROVIDER");
     }
@@ -180,6 +184,12 @@ export class OAuthManager {
     };
 
     await this.tokenStore.setToken(userId, providerId, "default", token);
+    // schedule next refresh if we have an expiry
+    if (token.expiresAt) {
+      const lead = provider?.refresh?.leadMs ?? 600_000;
+      const runAt = Math.max(0, token.expiresAt - lead);
+      await this.publisher.scheduleRefresh({ userId, providerId, accountId: "default", runAt });
+    }
     return { token, userId, providerId };
   }
 
@@ -226,7 +236,8 @@ export class OAuthManager {
    * Handles dynamic client registration if needed
    */
   async getAuthorizationUrl(providerId: string, userId: string): Promise<string> {
-    const oauthSpec = this.providers.get(providerId);
+    const provider = this.providers.get(providerId);
+    const oauthSpec = provider?.oauth;
     if (!oauthSpec) {
       throw new OAuthError(`Provider ${providerId} not configured`, "UNKNOWN_PROVIDER");
     }
@@ -306,7 +317,8 @@ export class OAuthManager {
       throw new OAuthError("No refresh token available", "NO_REFRESH_TOKEN");
     }
 
-    const oauthSpec = this.providers.get(providerId);
+    const provider = this.providers.get(providerId);
+    const oauthSpec = provider?.oauth;
     if (!oauthSpec) {
       throw new OAuthError(`Provider ${providerId} not configured`, "UNKNOWN_PROVIDER");
     }
@@ -342,6 +354,11 @@ export class OAuthManager {
     };
 
     await this.tokenStore.setToken(userId, providerId, "default", newToken);
+    if (newToken.expiresAt) {
+      const lead = provider?.refresh?.leadMs ?? 600_000;
+      const runAt = Math.max(0, newToken.expiresAt - lead);
+      await this.publisher.scheduleRefresh({ userId, providerId, accountId: "default", runAt });
+    }
     return newToken;
   }
 

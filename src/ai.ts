@@ -1,7 +1,7 @@
 import OpenAI from 'openai';
 import open from 'open';
 import type { OAuthManager } from './oauth.js';
-import type { ProviderConfig } from './types.js';
+import type { ProviderConfig, JSONSchema } from './types.js';
 import type { MCPClient } from './client.js';
 
 /**
@@ -14,6 +14,10 @@ import type { MCPClient } from './client.js';
  */
 export class AIAgent {
   private openai: OpenAI;
+  private toolCache: Map<string, { tools: MCPTool[]; refreshedAt: number }>; // key: `${userId}:${providerId}`
+
+  // Minimal shapes for tools and tool-calls we care about
+  private static readonly EMPTY_ARGS: Record<string, unknown> = {};
 
   /**
    * @param oauthManager - Manages OAuth token lifecycle
@@ -28,6 +32,7 @@ export class AIAgent {
     openaiApiKey: string
   ) {
     this.openai = new OpenAI({ apiKey: openaiApiKey });
+    this.toolCache = new Map();
   }
 
 
@@ -39,52 +44,91 @@ export class AIAgent {
    * @returns JSON-RPC response with result or error
    */
   async execute(
-    args: { prompt: string; providerId: string },
+    args: { prompt: string },
     userId: string,
     requestId: number | string
   ) {
     try {
-      const providerId = args.providerId;
-      const provider = this.providers.get(providerId);
-      if (!provider) {
+      const prompt = args.prompt;
+
+      const authStatuses = await this.getProviderAuthStatus(userId);
+      const selectedProviders = await this.selectProviders(prompt, authStatuses);
+
+      if (!selectedProviders || selectedProviders.length === 0) {
         return {
           jsonrpc: '2.0',
           id: requestId,
-          error: { code: -32603 /* JSON-RPC internal error */, message: `Provider ${providerId} not found` }
+          error: { code: -32603, message: 'Could not determine which providers to use' }
         };
       }
 
-      // Check if provider needs authentication
-      if (provider.oauth) {
-        const token = await this.oauthManager.getToken(userId, providerId);
-        if (!token) {
-          // Provider requires auth but isn't authenticated
-          return this.getNoAuthError(userId, requestId, providerId);
+      // Auth gating: ensure all selected providers are authenticated if required
+      const missingAuth: string[] = [];
+      for (const providerId of selectedProviders) {
+        const provider = this.providers.get(providerId);
+        if (provider?.oauth) {
+          const token = await this.oauthManager.getToken(userId, providerId);
+          if (!token) missingAuth.push(providerId);
+        }
+      }
+      if (missingAuth.length > 0) {
+        return this.getNoAuthError(userId, requestId, missingAuth);
+      }
+
+      // Load/refresh tools for selected providers and aggregate with namespacing
+      const aggregatedTools: AggregatedTool[] = [];
+      for (const providerId of selectedProviders) {
+        const provider = this.providers.get(providerId);
+        if (!provider) continue;
+
+        const cacheKey = `${userId}:${providerId}`;
+        const freshToolsRaw = await this.mcpClient.getProviderTools(provider, userId);
+        const freshTools: MCPTool[] = (Array.isArray(freshToolsRaw) ? freshToolsRaw : []).map((t: any) => ({
+          name: String(t?.name ?? ''),
+          description: typeof t?.description === 'string' ? t.description : undefined,
+          inputSchema: (t?.inputSchema ?? undefined) as JSONSchema | undefined
+        })).filter(t => t.name.length > 0);
+        this.toolCache.set(cacheKey, { tools: freshTools, refreshedAt: Date.now() });
+
+        for (const tool of freshTools) {
+          aggregatedTools.push({
+            providerId,
+            name: `${providerId}.${tool.name}`,
+            description: tool.description || '',
+            inputSchema: tool.inputSchema || {}
+          });
         }
       }
 
-      const providerTools = await this.mcpClient.getProviderTools(provider, userId);
-      const toolSelection = await this.selectTool(args.prompt, providerTools);
-      if (!toolSelection) {
+      const plannedTools = await this.planTools(prompt, aggregatedTools);
+      if (!plannedTools || plannedTools.length === 0) {
         return {
           jsonrpc: '2.0',
           id: requestId,
-          error: { code: -32603 /* JSON-RPC internal error */, message: 'Could not determine which tool to use' }
+          error: { code: -32603, message: 'Could not determine which tool(s) to use' }
         };
       }
 
-      const result = await this.mcpClient.executeProviderTool(
-        providerId,
-        toolSelection.name,
-        toolSelection.arguments,
-        userId,
-        this.providers
-      );
+      const results: Array<{ providerId: string; tool: string; result: unknown }> = [];
+      for (const step of plannedTools) {
+        const [providerId, rawToolName] = step.name.split('.', 2);
+        if (!providerId || !rawToolName) {
+          continue;
+        }
+        const execResult = await this.mcpClient.executeProviderTool(
+          providerId,
+          rawToolName,
+          step.arguments,
+          userId,
+          this.providers
+        );
+        results.push({ providerId, tool: rawToolName, result: execResult });
+      }
 
       return {
         jsonrpc: '2.0',
         id: requestId,
-        result
+        result: results.length === 1 ? results[0] : results
       };
     } catch (error: any) {
       return {
@@ -125,14 +169,17 @@ export class AIAgent {
    * @param providerId - Provider that needs authentication
    * @returns Error response with authentication URLs
    */
-  private async getNoAuthError(userId: string, requestId: number | string, providerId?: string) {
+  private async getNoAuthError(userId: string, requestId: number | string, providerId?: string | string[]) {
     const authUrls: Record<string, string> = {};
 
-    // If specific provider requested, only authorize that one
+    // If specific provider(s) requested, only authorize those
     if (providerId) {
-      const provider = this.providers.get(providerId);
-      if (provider?.oauth) {
-        authUrls[providerId] = await this.oauthManager.getAuthorizationUrl(providerId, userId);
+      const ids = Array.isArray(providerId) ? providerId : [providerId];
+      for (const id of ids) {
+        const provider = this.providers.get(id);
+        if (provider?.oauth) {
+          authUrls[id] = await this.oauthManager.getAuthorizationUrl(id, userId);
+        }
       }
     } else {
       // Otherwise, show all providers that need auth
@@ -170,27 +217,27 @@ export class AIAgent {
    * @param authenticatedProviders - Available providers with auth status
    * @returns Selected provider ID or null if selection fails
    */
-  private async selectProvider(
+  private async selectProviders(
     prompt: string,
     authenticatedProviders: Array<{ id: string; authenticated: boolean }>
-  ): Promise<string | null> {
+  ): Promise<string[] | null> {
     const response = await this.openai.chat.completions.create({
       model: 'gpt-4o-mini',
       messages: [
         {
           role: 'system',
-          content: `You are a router that selects which service provider to use based on the user's request. Available providers: ${JSON.stringify(authenticatedProviders)}. Respond with ONLY the provider ID, nothing else.`
+          content: `You are a router that selects which service provider(s) to use based on the user's request. Available providers with auth: ${JSON.stringify(authenticatedProviders)}. Respond with a comma-separated list of provider IDs (e.g., "linear,sentry"). If ambiguous, respond with "clarify".`
         },
-        {
-          role: 'user',
-          content: prompt
-        }
+        { role: 'user', content: prompt }
       ],
       temperature: 0
     });
 
-    const providerSelectionContent = response.choices?.[0]?.message?.content;
-    return providerSelectionContent ? providerSelectionContent.trim().toLowerCase() : null;
+    const content = response.choices?.[0]?.message?.content?.trim().toLowerCase();
+    if (!content) return null;
+    if (content === 'clarify') return null;
+    const ids = content.split(',').map(s => s.trim()).filter(Boolean);
+    return ids.length > 0 ? ids : null;
   }
 
   /**
@@ -199,20 +246,20 @@ export class AIAgent {
    * @param providerTools - Available tools from the selected provider
    * @returns Selected tool name and parsed arguments, or null if selection fails
    */
-  private async selectTool(prompt: string, providerTools: any[]): Promise<{ name: string; arguments: any } | null> {
+  private async planTools(
+    prompt: string,
+    availableTools: AggregatedTool[]
+  ): Promise<PlannedToolStep[] | null> {
     const response = await this.openai.chat.completions.create({
       model: 'gpt-4o-mini',
       messages: [
         {
           role: 'system',
-          content: `You are a tool selector. Given a user request and available tools, you must select the best tool and extract the arguments. Available tools: ${JSON.stringify(providerTools)}`
+          content: 'You are a planner. Given a user request and available tools (possibly across providers), choose the minimal sequence of tool calls to fulfill the request. If one call is sufficient, choose one.'
         },
-        {
-          role: 'user',
-          content: prompt
-        }
+        { role: 'user', content: prompt }
       ],
-      tools: providerTools.map((tool: any) => ({
+      tools: availableTools.map(tool => ({
         type: 'function',
         function: {
           name: tool.name,
@@ -220,24 +267,55 @@ export class AIAgent {
           parameters: tool.inputSchema || {}
         }
       })),
-      tool_choice: 'required'
+      tool_choice: 'auto'
     });
 
-    const toolCall = (response.choices?.[0] as any)?.message?.tool_calls?.[0] as any;
-    if (!toolCall) {
-      return null;
+    const toolCalls = (response.choices?.[0] as { message?: { tool_calls?: OpenAIToolCall[] } })?.message?.tool_calls;
+    if (!toolCalls || toolCalls.length === 0) return null;
+
+    const steps: PlannedToolStep[] = [];
+    for (const call of toolCalls) {
+      const name = call.function?.name ?? '';
+      const rawArgs = call.function?.arguments ?? '';
+      if (!name) continue;
+      let argsObj: Record<string, unknown> = AIAgent.EMPTY_ARGS;
+      try {
+        const parsed = rawArgs ? JSON.parse(rawArgs) : {};
+        argsObj = (parsed && typeof parsed === 'object') ? parsed as Record<string, unknown> : AIAgent.EMPTY_ARGS;
+      } catch {
+        argsObj = AIAgent.EMPTY_ARGS;
+      }
+      steps.push({ name, arguments: argsObj });
     }
-
-    const selectedTool = toolCall.function?.name as string | undefined;
-    const toolArgs = (() => {
-      try { return JSON.parse(toolCall.function?.arguments ?? '{}'); } catch { return {}; }
-    })();
-
-    if (!selectedTool) {
-      return null;
-    }
-
-    return { name: selectedTool, arguments: toolArgs };
+    return steps;
   }
 }
+
+// Local helper types
+type MCPTool = {
+  name: string;
+  description?: string;
+  inputSchema?: JSONSchema;
+};
+
+type AggregatedTool = {
+  providerId: string;
+  name: string;
+  description?: string;
+  inputSchema?: JSONSchema;
+};
+
+type PlannedToolStep = {
+  name: string;
+  arguments: Record<string, unknown>;
+};
+
+type OpenAIToolCall = {
+  type?: string;
+  id?: string;
+  function?: {
+    name?: string;
+    arguments?: string;
+  }
+};
 
